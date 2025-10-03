@@ -1,7 +1,5 @@
 import torch
 import numpy as np
-import numpy as np
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset
@@ -12,6 +10,11 @@ import argparse
 import warnings
 
 warnings.filterwarnings('ignore')
+
+try:
+    torch.set_float32_matmul_precision('high')
+except AttributeError:
+    pass
 
 parser = argparse.ArgumentParser(description='manual to this script')
 parser.add_argument("--dataset", type=str, default='nsl')
