@@ -2,18 +2,14 @@ import torch
 import numpy as np
 import random
 import pandas as pd
-import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.base import BaseEstimator, TransformerMixin
-import torch
 import torch.nn as nn
 import math
-import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score,confusion_matrix, precision_score, recall_score, f1_score
 import scipy.optimize as opt
 import torch.distributions as dist
-from sklearn.metrics import accuracy_score
 
 def load_data(data_path):
     data = pd.read_csv(data_path)
@@ -54,36 +50,96 @@ def description(data):
     print("Number of samples(examples) ",data.shape[0]," Number of features",data.shape[1])
     print("Dimension of data set ",data.shape)
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1024):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+
 class AE(nn.Module):
-    def __init__(self, input_dim):
+    """Transformer-based autoencoder used for representation learning."""
+
+    def __init__(self, input_dim: int):
         super(AE, self).__init__()
 
-        # Find the nearest power of 2 to input_dim
-        nearest_power_of_2 = 2 ** round(math.log2(input_dim))
+        # Determine model width based on the feature dimension while keeping it GPU friendly.
+        nearest_power_of_2 = 2 ** math.ceil(math.log2(max(16, input_dim)))
+        self.d_model = min(256, nearest_power_of_2)
 
-        # Calculate the dimensions of the 2nd/4th layer and the 3rd layer.
-        second_fourth_layer_size = nearest_power_of_2 // 2  # A half
-        third_layer_size = nearest_power_of_2 // 4         # A quarter
+        # Ensure the embedding dimension is divisible by the number of heads.
+        self.nhead = 8 if self.d_model >= 64 else 4 if self.d_model >= 32 else 2
+        self.seq_len = input_dim
+        self.latent_dim = max(self.d_model // 2, 16)
 
-        # Create encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, second_fourth_layer_size),
-            nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, third_layer_size),
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.d_model * 2,
+            dropout=0.1,
+            batch_first=False,
+            activation='gelu',
         )
+        self.encoder_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # Create decoder
-        self.decoder = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(third_layer_size, second_fourth_layer_size),
-            nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, input_dim),
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.d_model * 2,
+            dropout=0.1,
+            batch_first=False,
+            activation='gelu',
         )
+        self.decoder_transformer = nn.TransformerDecoder(decoder_layer, num_layers=2)
 
-    def forward(self, x):
-        encode = self.encoder(x)
-        decode = self.decoder(encode)
-        return encode, decode
+        self.positional_encoding = PositionalEncoding(self.d_model)
+        self.target_positional_encoding = PositionalEncoding(self.d_model)
+
+        self.input_projection = nn.Linear(1, self.d_model)
+        self.latent_projection = nn.Linear(self.d_model, self.latent_dim)
+        self.memory_projection = nn.Linear(self.latent_dim, self.d_model)
+        self.output_projection = nn.Linear(self.d_model, 1)
+
+        # Learnable queries used by the decoder to reconstruct the original feature sequence.
+        self.decoder_queries = nn.Parameter(torch.zeros(self.seq_len, self.d_model))
+        nn.init.normal_(self.decoder_queries, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor):
+        # Prepare source tokens.
+        src = x.unsqueeze(-1)  # (batch, seq_len, 1)
+        src = self.input_projection(src)  # (batch, seq_len, d_model)
+        src = src.transpose(0, 1)  # (seq_len, batch, d_model)
+        src = self.positional_encoding(src)
+
+        # Encoder
+        memory = self.encoder_transformer(src)  # (seq_len, batch, d_model)
+
+        pooled_memory = memory.mean(dim=0)  # (batch, d_model)
+        latent = self.latent_projection(pooled_memory)  # (batch, latent_dim)
+
+        # Blend the latent representation back into the encoder memory before decoding.
+        decoder_memory = self.memory_projection(latent).unsqueeze(0)
+        memory = memory + decoder_memory
+
+        tgt = self.decoder_queries.unsqueeze(1).expand(-1, x.size(0), -1)
+        tgt = self.target_positional_encoding(tgt)
+
+        decoded = self.decoder_transformer(tgt, memory)
+        decoded = decoded.transpose(0, 1)  # (batch, seq_len, d_model)
+        recon = self.output_projection(decoded).squeeze(-1)  # (batch, seq_len)
+
+        return latent, recon
 
 class CRCLoss(nn.Module):
     def __init__(self, device, temperature=0.1, scale_by_temperature=True):
